@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -40,9 +41,19 @@ class _DashboardPageState extends State<DashboardPage> {
   String? _reservedBikeId;
   int _reserveSecondsLeft = 0;
 
-  BitmapDescriptor? _bikeIcon;
   Set<Marker> _markers = {};
-  void _startReserveTimer(String bikeId) {
+
+  final DatabaseReference _bikesRef =
+  FirebaseDatabase.instance.ref().child('bikes');
+
+  StreamSubscription<DatabaseEvent>? _bikesSubscription;
+  bool _hasMovedToBikeOnce = false;
+
+  BitmapDescriptor? _greenBikeIcon;
+  BitmapDescriptor? _redBikeIcon;
+  BitmapDescriptor? _blueBikeIcon;
+
+  void _startReserveTimer(String bikeId, VoidCallback? onTick) {
     _reserveTimer?.cancel();
 
     setState(() {
@@ -50,86 +61,145 @@ class _DashboardPageState extends State<DashboardPage> {
       _reserveSecondsLeft = 120;
     });
 
-    _reserveTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    onTick?.call();
+
+    _reserveTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
       if (_reserveSecondsLeft <= 1) {
         timer.cancel();
+
+        await _bikesRef.child(bikeId).update({
+          'padlock': 'locked',
+          'reserveUntil': 0,
+        });
+
         if (!mounted) return;
 
         setState(() {
           _reservedBikeId = null;
           _reserveSecondsLeft = 0;
         });
+
+        onTick?.call();
       } else {
         if (!mounted) return;
+
         setState(() {
           _reserveSecondsLeft--;
         });
+
+        onTick?.call();
       }
     });
   }
 
-  void _cancelReserve() {
+  Future<void> _cancelReserve() async {
     _reserveTimer?.cancel();
+
+    final bikeId = _reservedBikeId;
+
     setState(() {
       _reservedBikeId = null;
       _reserveSecondsLeft = 0;
     });
-  }
 
+    if (bikeId != null) {
+      await _bikesRef.child(bikeId).update({
+        'padlock': 'locked',
+        'reserveUntil': 0,
+      });
+    }
+  }
   String _formatReserveTime(int seconds) {
     final minutes = seconds ~/ 60;
     final remainingSeconds = seconds % 60;
     return '${minutes.toString().padLeft(2, '0')}:${remainingSeconds.toString().padLeft(2, '0')}';
   }
 
-  void _setMarkers() {
-    final icon = _bikeIcon ?? BitmapDescriptor.defaultMarker;
+  void _listenToBikeMarkers() {
+    _bikesSubscription?.cancel();
 
-    _markers = {
-      Marker(
-        markerId: const MarkerId('bike_1'),
-        position: const LatLng(8.241241935176603, 124.24462290082343),
-        infoWindow: const InfoWindow(title: 'Bike 1'),
-        icon: icon,
-        onTap: () => _showBikeDetailsSheet(
-          bikeId: 'bike_1',
-          bikeName: 'Bike XXX-22564',
-          priceText: '10 php to start, then 5 php/min',
-        ),
-      ),
-      Marker(
-        markerId: const MarkerId('bike_2'),
-        position: const LatLng(8.241027710403017, 124.24390055672835),
-        infoWindow: const InfoWindow(title: 'Bike 2'),
-        icon: icon,
-        onTap: () => _showBikeDetailsSheet(
-          bikeId: 'bike_2',
-          bikeName: 'Bike XXX-22565',
-          priceText: '10 php to start, then 5 php/min',
-        ),
-      ),
-      Marker(
-        markerId: const MarkerId('bike_3'),
-        position: const LatLng(8.241556622139273, 124.24415820115104),
-        infoWindow: const InfoWindow(title: 'Bike 3'),
-        icon: icon,
-        onTap: () => _showBikeDetailsSheet(
-          bikeId: 'bike_3',
-          bikeName: 'Bike XXX-22566',
-          priceText: '10 php to start, then 5 php/min',
-        ),
-      ),
-    };
+    _bikesSubscription = _bikesRef.onValue.listen((event) async {
+      try {
+        final snapshot = event.snapshot;
 
-    if (mounted) {
-      setState(() {});
-    }
+        if (!snapshot.exists) {
+          if (mounted) {
+            setState(() {
+              _markers = {};
+            });
+          }
+          return;
+        }
+
+        final raw = snapshot.value;
+        if (raw is! Map) return;
+
+        final data = Map<dynamic, dynamic>.from(raw);
+        final Set<Marker> loadedMarkers = {};
+        LatLng? firstBikePosition;
+
+        data.forEach((key, value) {
+          if (value is Map) {
+            final mapValue = Map<dynamic, dynamic>.from(value);
+            final lat = double.tryParse(mapValue['latitude'].toString());
+            final lng = double.tryParse(mapValue['longitude'].toString());
+
+            final padlock = mapValue['padlock']?.toString().toLowerCase() ?? 'locked';
+
+            final icon = (padlock == 'unlocked')
+                ? (_redBikeIcon ?? BitmapDescriptor.defaultMarker)
+                : (padlock == 'reserve')
+                    ? (_blueBikeIcon ?? BitmapDescriptor.defaultMarker)
+                    : (_greenBikeIcon ?? BitmapDescriptor.defaultMarker);
+
+            if (lat != null && lng != null) {
+              final bikeId = key.toString();
+
+              final bikePosition = LatLng(lat, lng);
+              firstBikePosition ??= bikePosition;
+
+              loadedMarkers.add(
+                Marker(
+                  markerId: MarkerId(bikeId),
+                  position: bikePosition,
+                  infoWindow: InfoWindow(
+                    title: 'Bike ${bikeId.replaceAll('bike', '')}',
+                  ),
+                  icon: icon,
+                  onTap: () => _showBikeDetailsSheet(
+                    bikeId: bikeId,
+                    bikeName: 'Bike ${bikeId.replaceAll('bike', '').padLeft(3, '0')}',
+                    priceText: '10 php to start, then 5 php/min',
+                    padlockStatus: padlock,
+                  ),
+                ),
+              );
+            }
+          }
+        });
+
+        if (!mounted) return;
+
+        setState(() {
+          _markers = loadedMarkers;
+        });
+
+        if (!_hasMovedToBikeOnce && firstBikePosition != null) {
+          _hasMovedToBikeOnce = true;
+          _currentCenter = firstBikePosition!;
+          await _moveCamera(firstBikePosition!);
+        }
+      } catch (e) {
+        debugPrint('Error listening to bike markers: $e');
+      }
+    });
   }
 
   void _showBikeDetailsSheet({
     required String bikeId,
     required String bikeName,
     required String priceText,
+    required String padlockStatus,
   }) {
     showModalBottomSheet(
       context: context,
@@ -138,8 +208,10 @@ class _DashboardPageState extends State<DashboardPage> {
       builder: (context) {
         return StatefulBuilder(
           builder: (context, modalSetState) {
+            final bool isInUse = padlockStatus == 'unlocked';
             final bool isReserved =
-                _reservedBikeId == bikeId && _reserveSecondsLeft > 0;
+                padlockStatus == 'reserve' ||
+                    (!isInUse && _reservedBikeId == bikeId && _reserveSecondsLeft > 0);
 
             return Container(
               decoration: const BoxDecoration(
@@ -198,7 +270,26 @@ class _DashboardPageState extends State<DashboardPage> {
                                         ),
                                       ),
                                     ),
-                                    if (isReserved)
+                                    if (isInUse)
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 4,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.red.shade100,
+                                          borderRadius: BorderRadius.circular(20),
+                                        ),
+                                        child: Text(
+                                          'In Use',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w700,
+                                            color: Colors.red.shade700,
+                                          ),
+                                        ),
+                                      )
+                                    else if (isReserved)
                                       Container(
                                         padding: const EdgeInsets.symmetric(
                                           horizontal: 10,
@@ -247,8 +338,9 @@ class _DashboardPageState extends State<DashboardPage> {
                             _actionChip(
                               icon: Icons.cancel_outlined,
                               label: 'Cancel',
-                              onTap: () {
-                                _cancelReserve();
+                              iconColor: Colors.red, // 🔴 this makes it red
+                              onTap: () async {
+                                await _cancelReserve();
                                 modalSetState(() {});
                               },
                             ),
@@ -345,7 +437,9 @@ class _DashboardPageState extends State<DashboardPage> {
                         width: double.infinity,
                         height: 56,
                         child: ElevatedButton(
-                          onPressed: () async {
+                          onPressed: isInUse
+                              ? null
+                              : () async {
                             if (isReserved) {
                               Navigator.pop(context);
 
@@ -364,13 +458,21 @@ class _DashboardPageState extends State<DashboardPage> {
                                 );
                               }
                             } else {
-                              _startReserveTimer(bikeId);
-                              modalSetState(() {});
+                              await _reserveBike(
+                                bikeId,
+                                onTick: () {
+                                  modalSetState(() {});
+                                },
+                              );
                             }
                           },
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF8BE08E),
+                            backgroundColor: isInUse
+                                ? Colors.red.shade300
+                                : const Color(0xFF8BE08E),
                             foregroundColor: Colors.black87,
+                            disabledBackgroundColor: Colors.red.shade300,
+                            disabledForegroundColor: Colors.black87,
                             elevation: 0,
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(18),
@@ -380,21 +482,25 @@ class _DashboardPageState extends State<DashboardPage> {
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
                               Text(
-                                isReserved ? 'Scan to ride' : 'Reserve',
+                                isInUse
+                                    ? 'In Use'
+                                    : (isReserved ? 'Scan to ride' : 'Reserve'),
                                 style: const TextStyle(
                                   fontSize: 18,
                                   fontWeight: FontWeight.w700,
                                 ),
                               ),
-                              Text(
-                                isReserved
-                                    ? _formatReserveTime(_reserveSecondsLeft)
-                                    : 'Free for 2 minutes',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.black.withOpacity(0.7),
-                                ),
-                              ),
+                              // Text(
+                              //   isInUse
+                              //       ? 'This bike is currently being used'
+                              //       : (isReserved
+                              //       ? _formatReserveTime(_reserveSecondsLeft)
+                              //       : 'Free for 2 minutes'),
+                              //   style: TextStyle(
+                              //     fontSize: 11,
+                              //     color: Colors.black.withOpacity(0.7),
+                              //   ),
+                              // ),
                             ],
                           ),
                         ),
@@ -465,7 +571,6 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void initState() {
     super.initState();
-    _setMarkers();
     _loadBikeIcon();
     _initializePermissions();
   }
@@ -665,12 +770,55 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _loadBikeIcon() async {
-    _bikeIcon = await BitmapDescriptor.fromAssetImage(
-      const ImageConfiguration(size: Size(1, 1)),
-      'assets/icons/bike_marker.png',
-    );
+    try {
+      _greenBikeIcon = await BitmapDescriptor.fromAssetImage(
+        const ImageConfiguration(size: Size(48, 48)),
+        'assets/icons/green_bike_marker.png',
+      );
 
-    _setMarkers();
+      _redBikeIcon = await BitmapDescriptor.fromAssetImage(
+        const ImageConfiguration(size: Size(48, 48)),
+        'assets/icons/red_bike_marker.png',
+      );
+
+      _blueBikeIcon = await BitmapDescriptor.fromAssetImage(
+        const ImageConfiguration(size: Size(48, 48)),
+        'assets/icons/blue_bike_marker.png',
+      );
+
+      debugPrint('Bike marker icons loaded successfully');
+    } catch (e) {
+      debugPrint('Failed to load bike marker asset: $e');
+      _greenBikeIcon = BitmapDescriptor.defaultMarker;
+      _redBikeIcon = BitmapDescriptor.defaultMarker;
+      _blueBikeIcon = BitmapDescriptor.defaultMarker;
+    }
+
+    _listenToBikeMarkers();
+  }
+
+  Future<void> _reserveBike(String bikeId, {VoidCallback? onTick}) async {
+    final ref = _bikesRef.child(bikeId);
+
+    final snapshot = await ref.get();
+    if (!snapshot.exists) return;
+
+    final data = Map<dynamic, dynamic>.from(snapshot.value as Map);
+    final padlock = (data['padlock'] ?? 'locked').toString().toLowerCase();
+
+    if (padlock == 'unlocked' || padlock == 'reserve') {
+      return;
+    }
+
+    final reserveUntil =
+        DateTime.now().millisecondsSinceEpoch + (2 * 60 * 1000);
+
+    await ref.update({
+      'padlock': 'reserve',
+      'reserveUntil': reserveUntil,
+    });
+
+    _startReserveTimer(bikeId, onTick);
   }
 
   String _getDisplayName(User? user) {
@@ -904,6 +1052,7 @@ class _DashboardPageState extends State<DashboardPage> {
     required IconData icon,
     required String label,
     required VoidCallback onTap,
+    Color iconColor = Colors.black,
   }) {
     return InkWell(
       onTap: onTap,
@@ -917,7 +1066,7 @@ class _DashboardPageState extends State<DashboardPage> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 18, color: Colors.grey.shade700),
+            Icon(icon, size: 18, color: iconColor),
             const SizedBox(width: 8),
             Text(
               label,
@@ -934,6 +1083,7 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void dispose() {
     _reserveTimer?.cancel();
+    _bikesSubscription?.cancel();
     super.dispose();
   }
 

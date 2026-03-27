@@ -100,7 +100,9 @@ flutter:
   # see https://flutter.dev/to/font-from-package
 
   assets:
-    - assets/icons/bike_marker.png
+    - assets/icons/green_bike_marker.png
+    - assets/icons/blue_bike_marker.png
+    - assets/icons/red_bike_marker.png
 
 flutter_launcher_icons:
   android: "launcher_icon"
